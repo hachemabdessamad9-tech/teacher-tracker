@@ -1,0 +1,104 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    /**
+     * CORE PHILOSOPHY:
+     * This ruleset enforces a strict Administrative Role-Based Access Control (RBAC) model. 
+     * Only users explicitly defined in the 'admin_users' collection have the authority 
+     * to manage teachers and record performance metrics.
+     *
+     * DATA STRUCTURE:
+     * - /admin_users/{uid}: Existence of a document here defines an admin.
+     * - /teachers/{teacherId}: Top-level collection for teacher profiles.
+     * - /teachers/{teacherId}/performanceRecords/{recordId}: Nested performance data.
+     *
+     * KEY SECURITY DECISIONS:
+     * - Role Lookup: Admin status is verified via the 'exists' check on the admin_users collection.
+     * - Relational Integrity: We enforce that the 'teacherId' in the document data matches 
+     *    the actual path to prevent data from being orphaned or misattributed.
+     * - Prototyping Flexibility: We do not enforce specific data types for names or scores 
+     *   to allow for rapid iteration, focusing purely on authorization.
+     *
+     * DENORMALIZATION FOR AUTHORIZATION:
+     * - The 'teacherId' is denormalized into every PerformanceRecord document. This allows 
+     *   the rules to verify the relationship against the URL path without performing 
+     *   an expensive 'get()' on the parent Teacher document.
+     */
+
+    // --- Helper Functions ---
+
+    /**
+     * @description Checks if the request is from an authenticated user.
+     */
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    /**
+     * @description Determines if the authenticated user has administrative privileges.
+     * Relies on the existence of a document in the 'admin_users' collection matching the UID.
+     */
+    function isAdmin() {
+      return isSignedIn() && exists(/databases/$(database)/documents/admin_users/$(request.auth.uid));
+    }
+
+    /**
+     * @description Combines admin check with a verification that the document exists for modifications.
+     */
+    function isExistingAdmin() {
+      return isAdmin() && resource != null;
+    }
+
+    // --- Collection Rules ---
+
+    /**
+     * @description Rules for the admin_users collection. Admins can read their own status.
+     * Management of this collection (adding/removing admins) is typically handled via 
+     * Cloud Functions or a Super Admin, so writes are locked here.
+     * @path /admin_users/{uid}
+     */
+    match /admin_users/{uid} {
+      allow get: if isSignedIn() && request.auth.uid == uid;
+      allow list, create, update, delete: if false;
+    }
+
+    /**
+     * @description Manages teacher profiles. Access is restricted to administrators.
+     * @path /teachers/{teacherId}
+     * @allow (create) Admin user creates a teacher where document ID matches the 'id' field.
+     * @deny (list) Anonymous or non-admin user attempts to view the teacher directory.
+     * @principle Validates relational integrity between the path and the document's internal ID.
+     */
+    match /teachers/{teacherId} {
+      allow get, list: if isAdmin();
+      
+      allow create: if isAdmin() 
+        && request.resource.data.id == teacherId;
+      
+      allow update: if isExistingAdmin() 
+        && request.resource.data.id == resource.data.id;
+      
+      allow delete: if isExistingAdmin();
+    }
+
+    /**
+     * @description Manages performance records for a specific teacher.
+     * @path /teachers/{teacherId}/performanceRecords/{performanceRecordId}
+     * @allow (create) Admin creates a record ensuring the 'teacherId' field matches the parent path.
+     * @deny (update) Admin attempts to change the 'teacherId' field (immutability).
+     * @principle Uses denormalized 'teacherId' for fast path-consistency checks.
+     */
+    match /teachers/{teacherId}/performanceRecords/{performanceRecordId} {
+      allow get, list: if isAdmin();
+      
+      allow create: if isAdmin() 
+        && request.resource.data.teacherId == teacherId;
+      
+      allow update: if isExistingAdmin() 
+        && request.resource.data.teacherId == resource.data.teacherId;
+      
+      allow delete: if isExistingAdmin();
+    }
+  }
+}
